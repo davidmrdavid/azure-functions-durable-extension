@@ -13,6 +13,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.DurableTask.Listener
         public static async Task<WrappedFunctionResult> ExecuteFunctionInOrchestrationMiddleware(
             ITriggeredFunctionExecutor executor,
             TriggeredFunctionData triggerInput,
+            TaskCommonShim shim,
             DurableCommonContext context,
             CancellationToken cancellationToken)
         {
@@ -26,6 +27,8 @@ namespace Microsoft.Azure.WebJobs.Extensions.DurableTask.Listener
             try
             {
                 context.ExecutorCalledBack = false;
+                var timeoutSource = new System.Threading.Tasks.TaskCompletionSource<object>();
+                shim.TimeoutTask = timeoutSource.Task;
 
                 FunctionResult result = await executor.TryExecuteAsync(triggerInput, cancellationToken);
 
@@ -39,6 +42,12 @@ namespace Microsoft.Azure.WebJobs.Extensions.DurableTask.Listener
                     if (cancellationToken.IsCancellationRequested)
                     {
                         return WrappedFunctionResult.FunctionRuntimeFailure(result.Exception);
+                    }
+
+                    if (result.Exception is Microsoft.Azure.WebJobs.Host.FunctionTimeoutException)
+                    {
+                        timeoutSource.SetException(result.Exception);
+                        return WrappedFunctionResult.FunctionTimeoutError(result.Exception);
                     }
 
                     return WrappedFunctionResult.UserCodeFailure(result.Exception);
@@ -95,6 +104,11 @@ namespace Microsoft.Azure.WebJobs.Extensions.DurableTask.Listener
                 if (cancellationToken.IsCancellationRequested)
                 {
                     return WrappedFunctionResult.FunctionRuntimeFailure(result.Exception);
+                }
+
+                if (result.Exception is Microsoft.Azure.WebJobs.Host.FunctionTimeoutException)
+                {
+                    return WrappedFunctionResult.FunctionTimeoutError(result.Exception);
                 }
 
                 return WrappedFunctionResult.UserCodeFailure(result.Exception);

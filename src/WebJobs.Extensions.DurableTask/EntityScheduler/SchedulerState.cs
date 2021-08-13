@@ -54,6 +54,19 @@ namespace Microsoft.Azure.WebJobs.Extensions.DurableTask
             this.Queue.Enqueue(operationMessage);
         }
 
+        internal void PutBack(Queue<RequestMessage> messages)
+        {
+            if (this.Queue != null)
+            {
+                foreach (var message in this.Queue)
+                {
+                    messages.Enqueue(message);
+                }
+            }
+
+            this.Queue = messages;
+        }
+
         internal bool TryDequeue(out RequestMessage operationMessage)
         {
             operationMessage = null;

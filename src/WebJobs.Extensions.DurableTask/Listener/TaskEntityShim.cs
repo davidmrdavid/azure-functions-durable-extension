@@ -4,6 +4,8 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using DurableTask.Core;
 using Newtonsoft.Json;
@@ -53,6 +55,8 @@ namespace Microsoft.Azure.WebJobs.Extensions.DurableTask
         public int NumberEventsToReceive { get; set; }
 
         internal List<RequestMessage> OperationBatch => this.operationBatch;
+
+        internal RequestMessage LockRequest => this.lockRequest;
 
         internal int BatchPosition { get; private set; }
 
@@ -271,15 +275,39 @@ namespace Microsoft.Azure.WebJobs.Extensions.DurableTask
             }
             else
             {
+                var stopwatch = new Stopwatch();
+                stopwatch.Start();
+
                 // call the function once per operation in the batch
                 for (this.BatchPosition = 0; this.BatchPosition < this.operationBatch.Count; this.BatchPosition++)
                 {
+                    // first, check if we should interrupt the batch
+                    // (if we either timed out already, or risk timing out)
+                    if (this.TimeoutTask.IsCompleted || stopwatch.Elapsed > TimeSpan.FromMinutes(1))
+                    {
+                        // put the requests back into the request queue
+                        var queue = new Queue<RequestMessage>();
+                        for (int i = this.BatchPosition; i < this.operationBatch.Count; i++)
+                        {
+                            queue.Enqueue(this.operationBatch[i]);
+                        }
+
+                        if (this.lockRequest != null)
+                        {
+                            queue.Enqueue(this.lockRequest);
+                        }
+
+                        this.context.State.PutBack(queue);
+                        return;
+                    }
+
+                    // execute the operation
                     var request = this.operationBatch[this.BatchPosition];
                     await this.ProcessOperationRequestAsync(request);
                 }
             }
 
-            // process the lock request, if any
+            // process the lock request, if any. This is always the last operation in the batch.
             if (this.lockRequest != null)
             {
                 this.ProcessLockRequest(this.lockRequest);
@@ -297,7 +325,8 @@ namespace Microsoft.Azure.WebJobs.Extensions.DurableTask
                 request.Id.ToString(),
                 isReplay: false);
 
-            System.Diagnostics.Debug.Assert(this.context.State.LockedBy == request.ParentInstanceId, "Lock was set.");
+            // mark the entity state as locked
+            this.context.State.LockedBy = request.ParentInstanceId;
 
             System.Diagnostics.Debug.Assert(request.LockSet[request.Position].Equals(this.EntityId), "position is correct");
             request.Position++;
@@ -331,16 +360,23 @@ namespace Microsoft.Azure.WebJobs.Extensions.DurableTask
             var stopwatch = new System.Diagnostics.Stopwatch();
             stopwatch.Start();
 
-            string exceptionDetails = string.Empty;
+            Exception exception = null;
 
             try
             {
                 Task invokeTask = this.FunctionInvocationCallback();
                 if (invokeTask is Task resultTask)
                 {
-                    await resultTask;
+                    var completedTask = await Task.WhenAny(resultTask, this.TimeoutTask);
 
-                    stopwatch.Stop();
+                    if (completedTask == this.TimeoutTask)
+                    {
+                        exception = this.TimeoutTask.Exception;
+                    }
+                    else
+                    {
+                        await resultTask;
+                    }
                 }
                 else
                 {
@@ -349,15 +385,18 @@ namespace Microsoft.Azure.WebJobs.Extensions.DurableTask
             }
             catch (Exception e)
             {
-                stopwatch.Stop();
+                exception = e;
+            }
 
-                exceptionDetails = e.ToString();
+            stopwatch.Stop();
 
-                this.context.CaptureApplicationError(e);
+            if (exception != null)
+            {
+                this.context.CaptureApplicationError(exception);
 
                 // exception must be sent with response back to caller
                 this.context.CurrentOperationResponse.SetExceptionResult(
-                    e,
+                    exception,
                     this.context.CurrentOperation.Operation,
                     this.errorDataConverter);
 
@@ -414,7 +453,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.DurableTask
                         request.Id.ToString(),
                         request.Operation,
                         this.Config.GetIntputOutputTrace(this.context.RawInput),
-                        exceptionDetails,
+                        exception.ToString(),
                         stopwatch.Elapsed.TotalMilliseconds,
                         isReplay: false);
             }
@@ -430,25 +469,44 @@ namespace Microsoft.Azure.WebJobs.Extensions.DurableTask
 
         private async Task ExecuteOutOfProcBatch()
         {
-            object outOfProcResults = null;
+            OutOfProcResult outOfProcResult = null;
 
-            Task invokeTask = this.FunctionInvocationCallback();
-            if (invokeTask is Task<object> resultTask)
+            Task invokeTask = await Task.WhenAny(this.FunctionInvocationCallback(), this.TimeoutTask);
+
+            if (invokeTask == this.TimeoutTask)
             {
-                outOfProcResults = await resultTask;
+                // for now, we treat this as if ALL operations in the batch failed with a timeout exception.
+                // in the future, we may want to catch timeouts out-of-proc and return results for the completed operations.
+                outOfProcResult = new OutOfProcResult()
+                {
+                    EntityExists = this.context.State.EntityExists,
+                    EntityState = this.context.State.EntityState,
+                    Results = this.OperationBatch.Select(mbox => new OutOfProcResult.OperationResult()
+                    {
+                        IsError = true,
+                        DurationInMilliseconds = 0,
+                        Result = this.TimeoutTask.Exception.Message,
+                    }).ToList(),
+                    Signals = new List<OutOfProcResult.Signal>(),
+                };
+            }
+            else if (invokeTask is Task<object> resultTask)
+            {
+                try
+                {
+                    var outOfProcResults = await resultTask;
+                    var jObj = outOfProcResults as JObject;
+                    outOfProcResult = jObj.ToObject<OutOfProcResult>();
+                }
+                catch (Exception e)
+                {
+                    throw new ArgumentException("Out of proc orchestrators must return a valid JSON schema.", e);
+                }
             }
             else
             {
                 throw new InvalidOperationException("The WebJobs runtime returned a invocation task that does not support return values!");
             }
-
-            var jObj = outOfProcResults as JObject;
-            if (jObj == null)
-            {
-                throw new ArgumentException("Out of proc orchestrators must return a valid JSON schema.");
-            }
-
-            var outOfProcResult = jObj.ToObject<OutOfProcResult>();
 
             // update the state
             this.context.State.EntityExists = outOfProcResult.EntityExists;

@@ -717,6 +717,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.DurableTask
                         },
 #pragma warning restore CS0618
                     },
+                    shim,
                     context,
                     this.hostLifetimeService.OnStopping);
 
@@ -869,14 +870,16 @@ namespace Microsoft.Azure.WebJobs.Extensions.DurableTask
                     }
                 }
 
-                // 2. We add as many requests from the queue to the batch as possible (stopping at lock requests)
+                // 2. We add as many requests from the queue to the batch as possible,
+                // stopping at lock requests or when the maximum batch size is reached
                 while (entityContext.State.LockedBy == null
+                    && entityShim.LockRequest == null
+                    && entityShim.OperationBatch.Count < this.Options.MaxEntityOperationBatchSize
                     && entityContext.State.TryDequeue(out var request))
                 {
                     if (request.IsLockRequest)
                     {
                         entityShim.AddLockRequestToBatch(request);
-                        entityContext.State.LockedBy = request.ParentInstanceId;
                     }
                     else
                     {
@@ -925,21 +928,32 @@ namespace Microsoft.Azure.WebJobs.Extensions.DurableTask
                     },
 #pragma warning restore CS0618
                 },
+                entityShim,
                 entityContext,
                 this.hostLifetimeService.OnStopping);
 
-            if (result.ExecutionStatus == WrappedFunctionResult.FunctionResultStatus.FunctionsRuntimeError)
+            switch (result.ExecutionStatus)
             {
-                this.TraceHelper.FunctionAborted(
+                case WrappedFunctionResult.FunctionResultStatus.Success:
+                    break;
+
+                case WrappedFunctionResult.FunctionResultStatus.FunctionTimeoutError:
+                    await entityShim.TimeoutTask;
+                    break;
+
+                case WrappedFunctionResult.FunctionResultStatus.FunctionsRuntimeError:
+
+                    this.TraceHelper.FunctionAborted(
                     this.Options.HubName,
                     entityContext.FunctionName,
                     entityContext.InstanceId,
                     $"An internal error occurred while attempting to execute this function. The execution will be aborted and retried. Details: {result.Exception}",
-                    functionType: FunctionType.Orchestrator);
+                    functionType: FunctionType.Entity);
 
-                // This will abort the execution and cause the message to go back onto the queue for re-processing
-                throw new SessionAbortedException(
-                    $"An internal error occurred while attempting to execute '{entityContext.FunctionName}'.", result.Exception);
+                    // This will abort the execution and cause the message to go back onto the queue for re-processing
+                    throw new SessionAbortedException(
+                        $"An internal error occurred while attempting to execute '{entityContext.FunctionName}'.",
+                        result.Exception);
             }
 
             await entityContext.RunDeferredTasks();
