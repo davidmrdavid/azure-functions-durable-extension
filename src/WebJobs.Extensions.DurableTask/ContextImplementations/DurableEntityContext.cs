@@ -313,9 +313,10 @@ namespace Microsoft.Azure.WebJobs.Extensions.DurableTask
             this.CurrentStateAccess = StateAccess.Accessed;
         }
 
-        internal bool TryWriteback(out ResponseMessage serializationErrorMessage, string operation = null)
+        internal bool TryWriteback(out ResponseMessage serializationErrorMessage, out Exception exception, string operation = null)
         {
             serializationErrorMessage = null;
+            exception = null;
 
             if (this.CurrentStateAccess == StateAccess.Deleted)
             {
@@ -341,6 +342,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.DurableTask
 
                     serializationErrorMessage = new ResponseMessage();
                     serializationErrorMessage.SetExceptionResult(serializationException, operation, this.errorDataConverter);
+                    exception = serializationException;
 
                     this.CurrentStateAccess = StateAccess.NotAccessed;
                     this.CurrentState = null;

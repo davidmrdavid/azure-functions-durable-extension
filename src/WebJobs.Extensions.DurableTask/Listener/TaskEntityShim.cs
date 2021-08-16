@@ -222,7 +222,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.DurableTask
                 {
                     // we are writing back the state here, after executing
                     // the entire batch of operations.
-                    writeBackSuccessful = this.context.TryWriteback(out serializationErrorMessage);
+                    writeBackSuccessful = this.context.TryWriteback(out serializationErrorMessage, out var _);
                 }
 
                 // Reschedule all signals that were received before their time
@@ -408,7 +408,7 @@ namespace Microsoft.Azure.WebJobs.Extensions.DurableTask
                 // we write back the entity state after each successful operation
                 if (!operationFailed)
                 {
-                    if (!this.context.TryWriteback(out var errorResponseMessage))
+                    if (!this.context.TryWriteback(out var errorResponseMessage, out exception))
                     {
                         // state serialization failed; create error response and roll back.
                         this.context.CurrentOperationResponse = errorResponseMessage;
